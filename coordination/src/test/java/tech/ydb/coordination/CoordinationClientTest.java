@@ -3,6 +3,7 @@ package tech.ydb.coordination;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -10,6 +11,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -51,6 +53,7 @@ public class CoordinationClientTest {
     public static final GrpcTransportRule YDB_TRANSPORT = new GrpcTransportRule();
     private static final Logger logger = LoggerFactory.getLogger(CoordinationClientTest.class);
     private final String path = YDB_TRANSPORT.getDatabase() + "/coordination-node";
+    private final Duration timeout = Duration.ofSeconds(60);
     private final CoordinationClient client = CoordinationClient.newClient(YDB_TRANSPORT);
 
     @Before
@@ -77,7 +80,7 @@ public class CoordinationClientTest {
         Assert.assertTrue(result.join().isSuccess());
     }
 
-    @Test(timeout = 60_000)
+    @Test(timeout = 20_000)
     public void coordinationSessionFullCycleTest() {
         final String semaphoreName = "test-semaphore";
         try (CoordinationSession session = client.createSession(path, Duration.ofSeconds(3)).join()) {
@@ -110,7 +113,7 @@ public class CoordinationClientTest {
         }
     }
 
-    @Test(timeout = 60_000)
+    @Test(timeout = 20_000)
     public void ephemeralSemaphoreBaseTest() {
         final String semaphoreName = "ephemeral-semaphore-base-test";
         /* 18446744073709551615 = 2^64 - 1 (or just -1 in Java) */
@@ -132,23 +135,24 @@ public class CoordinationClientTest {
         }
     }
 
-    @Test
+    @Test(timeout = 60_000)
     public void retryCoordinationSessionTest() {
         final CoordinationRpc rpc = new CoordinationProxyRpc(GrpcCoordinationRpc.useTransport(YDB_TRANSPORT));
         final String semaphoreName = "retry-test";
+        final int sessionNum = 10;
         CoordinationClient mockClient = new CoordinationClientImpl(rpc, YDB_TRANSPORT.getScheduler());
 
-        try (CoordinationSession session = mockClient.createSession(path, Duration.ofSeconds(100)).join();) {
-            session.createSemaphore(semaphoreName, 101).join();
-            CoordinationSemaphore semaphore = session.acquireSemaphore(semaphoreName, 90, Duration.ofSeconds(20))
+        try (CoordinationSession session = mockClient.createSession(path, timeout).join()) {
+            session.createSemaphore(semaphoreName, 90 + sessionNum + 1).join();
+            CoordinationSemaphore semaphore = session.acquireSemaphore(semaphoreName, 90, timeout)
                     .join().getValue();
             Assert.assertEquals(session.updateSemaphore(semaphoreName,
                     "data".getBytes(StandardCharsets.UTF_8)).join(), Status.SUCCESS);
 
             List<CoordinationSession> sessions = ThreadLocalRandom
                     .current()
-                    .ints(10)
-                    .mapToObj(n -> mockClient.createSession(path, Duration.ofSeconds(100)))
+                    .ints(sessionNum)
+                    .mapToObj(n -> mockClient.createSession(path, timeout))
                     .map(CompletableFuture::join)
                     .collect(Collectors.toList());
 
@@ -161,7 +165,7 @@ public class CoordinationClientTest {
                 otherSession.createSemaphore(semaphoreName, 1)
                         .whenComplete((result, thSem) -> {
                             Assert.assertNull(thSem);
-                            otherSession.acquireSemaphore(semaphoreName, 1, Duration.ofSeconds(100))
+                            otherSession.acquireSemaphore(semaphoreName, 1, timeout)
                                     .whenComplete((acquired, th) ->
                                             acquireFuture.complete(acquired));
                         });
@@ -172,12 +176,12 @@ public class CoordinationClientTest {
             ProxyStream.IS_STOPPED.set(false);
 
             for (CompletableFuture<Result<CoordinationSemaphore>> future : acquireFutures) {
-                Assert.assertEquals(Status.SUCCESS, future.get(100, TimeUnit.SECONDS).getStatus());
+                Assert.assertEquals(Status.SUCCESS, future.get(timeout.toMillis(), TimeUnit.MILLISECONDS).getStatus());
             }
             final SemaphoreDescription desc = session.describeSemaphore(semaphoreName, DescribeMode.DATA_ONLY)
-                    .get(100, TimeUnit.SECONDS)
+                    .get(timeout.toMillis(), TimeUnit.MILLISECONDS)
                     .getValue();
-            Assert.assertEquals(90 + 10, desc.getCount());
+            Assert.assertEquals(90 + sessionNum, desc.getCount());
             Assert.assertArrayEquals("changed data".getBytes(StandardCharsets.UTF_8), desc.getData());
 
             for (CoordinationSession coordinationSession : sessions) {
@@ -188,7 +192,7 @@ public class CoordinationClientTest {
         }
     }
 
-    @Test
+    @Test(timeout = 20_000)
     public void leaderElectionTest() throws InterruptedException {
         final Duration duration = Duration.ofSeconds(60);
         final String semaphoreName = "leader-election-semaphore";
@@ -244,6 +248,70 @@ public class CoordinationClientTest {
         latch3.await();
     }
 
+    private void publish(String semaphoreName, List<ServiceDiscovery> services) {
+        final ArrayList<CompletableFuture<Status>> createFutures = new ArrayList<>();
+        for (ServiceDiscovery service : services) {
+            createFutures.add(service.getSession().createSemaphore(semaphoreName, -1));
+        }
+        createFutures.forEach(CompletableFuture::join);
+        final ArrayList<CompletableFuture<Result<CoordinationSemaphore>>> acquireFutures = new ArrayList<>();
+        for (ServiceDiscovery service : services) {
+            acquireFutures.add(service.getSession().acquireSemaphore(semaphoreName, 1, false, timeout,
+                    service.getEndpoint().getBytes(StandardCharsets.UTF_8)));
+        }
+        acquireFutures.forEach(CompletableFuture::join);
+    }
+
+    private void subscribe(String semaphoreName,
+                           BiConsumer<ServiceDiscovery, SemaphoreDescription> newEndpointSubscriber,
+                           List<ServiceDiscovery> services) {
+        List<Result<SemaphoreDescription>> descriptions = services.stream()
+                .map(serviceDiscovery -> serviceDiscovery.getSession()
+                        .describeSemaphore(semaphoreName, DescribeMode.WITH_OWNERS,
+                                WatchMode.WATCH_OWNERS,
+                                changed -> YDB_TRANSPORT.getScheduler().execute(
+                                        () -> subscribe(semaphoreName, newEndpointSubscriber,
+                                                Collections.singletonList(serviceDiscovery))))
+                )
+                .map(CompletableFuture::join).collect(Collectors.toList());
+
+        descriptions.forEach(result -> Assert.assertTrue(result.isSuccess()));
+
+        for (int i = 0; i < services.size(); i++) {
+            newEndpointSubscriber.accept(services.get(i), descriptions.get(i).getValue());
+        }
+    }
+
+    @Test(timeout = 20_000)
+    public void serviceDiscoveryTest() {
+        final String semaphoreName = "service-discovery-test";
+        try (CoordinationSession session1 = client.createSession(path, timeout).join();
+             CoordinationSession session2 = client.createSession(path, timeout).join()) {
+
+            final List<ServiceDiscovery> services = new ArrayList<>(Arrays.asList(
+                    new ServiceDiscovery(session1, "localhost1"),
+                    new ServiceDiscovery(session2, "localhost2"))
+            );
+
+            publish(semaphoreName, services);
+
+            final BiConsumer<ServiceDiscovery, SemaphoreDescription> newEndpointSubscriber =
+                    (service, description) -> logger.trace("{} notified by changes. Services: {}", service,
+                            description);
+
+            subscribe(semaphoreName, newEndpointSubscriber, services);
+
+            final ServiceDiscovery service3 = new ServiceDiscovery(client.createSession(path, timeout).join(),
+                    "localhost3");
+
+            publish(semaphoreName, Collections.singletonList(service3));
+            services.add(service3);
+            subscribe(semaphoreName, newEndpointSubscriber, services);
+        } catch (Exception e) {
+            Assert.fail("There shouldn't be an exception.");
+        }
+    }
+
     @After
     public void deleteNode() {
         CompletableFuture<Status> result = client.dropNode(
@@ -252,6 +320,24 @@ public class CoordinationClientTest {
                         .build()
         );
         Assert.assertTrue(result.join().isSuccess());
+    }
+}
+
+class ServiceDiscovery {
+    private final CoordinationSession session;
+    private final String endpoint;
+
+    ServiceDiscovery(CoordinationSession session, String endpoint) {
+        this.session = session;
+        this.endpoint = endpoint;
+    }
+
+    public CoordinationSession getSession() {
+        return session;
+    }
+
+    public String getEndpoint() {
+        return endpoint;
     }
 }
 
