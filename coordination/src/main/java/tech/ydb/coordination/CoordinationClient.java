@@ -20,7 +20,7 @@ import tech.ydb.core.grpc.GrpcTransport;
 public interface CoordinationClient {
 
     static CoordinationClient newClient(@WillNotClose GrpcTransport transport) {
-        return new CoordinationClientImpl(GrpcCoordinationRpc.useTransport(transport));
+        return new CoordinationClientImpl(GrpcCoordinationRpc.useTransport(transport), transport.getScheduler());
     }
 
     /**
@@ -34,10 +34,10 @@ public interface CoordinationClient {
      *
      * @return coordination node session
      */
-    CompletableFuture<CoordinationSessionNew> createSession(String nodePath, Duration timeout);
+    CompletableFuture<CoordinationSession> createSession(String nodePath, Duration timeout);
 
-    CompletableFuture<CoordinationSessionNew> createSession(String nodePath, ScheduledExecutorService executor,
-                                                            Duration timeout);
+    CompletableFuture<CoordinationSession> createSession(String nodePath, ScheduledExecutorService executor,
+                                                         Duration timeout);
 
     /**
      * Creates a new coordination node.
